@@ -39,6 +39,7 @@ enum {
     FAN_SPEED_LOW = 0x01,
     FAN_SPEED_MEDIUM = 0x02,
     FAN_SPEED_HIGH = 0x03,
+    FAN_SPEED_MAX = 0x04,
 };
 
 
