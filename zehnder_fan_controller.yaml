@@ -60,6 +60,7 @@ button:
   - platform: template
     name: "Pair with Fan"
     icon: "mdi:wifi"
+    entity_category: config
     on_press:
       - lambda: |-
           id(ventilation_fan).start_pairing();
