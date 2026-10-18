@@ -4,6 +4,8 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 
+#include <cinttypes>
+
 namespace esphome {
 namespace zehnder_fan {
 
@@ -347,7 +349,7 @@ void ZehnderFanProtocol::handle_pairing_response() {
                          ((uint32_t)rx_buffer_[9] << 16) | ((uint32_t)rx_buffer_[10] << 24);
         info.my_device_id = pending_op_.data.pairing.my_device_id;
         
-        ESP_LOGD(TAG, "Found fan unit ID 0x%02X on network 0x%08X. Requesting to join...", 
+        ESP_LOGD(TAG, "Found fan unit ID 0x%02X on network 0x%08" PRIX32 ". Requesting to join...", 
                  info.main_unit_id, info.network_id);
         
         // Move to join phase
@@ -363,7 +365,7 @@ void ZehnderFanProtocol::handle_pairing_response() {
         auto &info = pending_op_.data.pairing.current_info;
         pairing_result_ = info;
         
-        ESP_LOGI(TAG, "Pairing successful! Network ID: 0x%08X, Fan ID: 0x%02X, My Device ID: 0x%02X",
+        ESP_LOGI(TAG, "Pairing successful! Network ID: 0x%08" PRIX32 ", Fan ID: 0x%02X, My Device ID: 0x%02X",
                  info.network_id, info.main_unit_id, info.my_device_id);
         
         complete_operation(true);
@@ -422,7 +424,7 @@ void ZehnderFanComponent::dump_config() {
     LOG_PIN("  TXEN Pin: ", this->txen_pin_);
     LOG_PIN("  DR Pin: ", this->dr_pin_);
     if (this->pairing_info_.has_value()) {
-        ESP_LOGCONFIG(TAG, "  Paired Network ID: 0x%08X", this->pairing_info_->network_id);
+        ESP_LOGCONFIG(TAG, "  Paired Network ID: 0x%08" PRIX32, this->pairing_info_->network_id);
         ESP_LOGCONFIG(TAG, "  Paired Fan ID: 0x%02X", this->pairing_info_->main_unit_id);
     } else {
         ESP_LOGCONFIG(TAG, "  Device is not paired.");
@@ -563,7 +565,7 @@ bool ZehnderFanComponent::load_pairing_info() {
     nvs_close(nvs_handle);
 
     if (err == ESP_OK && required_size == sizeof(FanPairingInfo)) {
-        ESP_LOGI(TAG, "Loaded pairing info: Network ID 0x%08X, Fan ID 0x%02X, My Device ID 0x%02X",
+        ESP_LOGI(TAG, "Loaded pairing info: Network ID 0x%08" PRIX32 ", Fan ID 0x%02X, My Device ID 0x%02X",
                  loaded_info.network_id, loaded_info.main_unit_id, loaded_info.my_device_id);
         this->pairing_info_ = loaded_info;
         return true;
