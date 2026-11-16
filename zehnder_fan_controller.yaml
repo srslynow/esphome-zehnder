@@ -2,7 +2,7 @@ esphome:
   name: esphome-zehnder-fan
   friendly_name: ESPHome Zehnder fan
   project:
-    name: srslynow.${friendly_name}
+    name: srslynow.esphome-zehnder
     version: v1
 
 esp32:
@@ -69,3 +69,12 @@ button:
     on_press:
       - lambda: |-
           id(ventilation_fan).start_pairing();
+
+  - platform: template
+    name: Forget Fan Pairing
+    icon: mdi:link-off
+    entity_category: config
+    disabled_by_default: true
+    on_press:
+      - lambda: |-
+          id(ventilation_fan).clear_pairing();

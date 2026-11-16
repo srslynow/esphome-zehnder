@@ -1,46 +1,85 @@
 #include "zehnder_fan.h"
 #include "esphome/core/log.h"
-#include "esphome/core/helpers.h"
-#include "nvs_flash.h"
-#include "nvs.h"
 
+#include <algorithm>
 #include <cinttypes>
+
+#ifdef USE_ESP32
+#include "nvs.h"
+#endif
 
 namespace esphome {
 namespace zehnder_fan {
 
 static const char *const TAG = "zehnder_fan";
-static const char *const NVS_NAMESPACE = "zehnder_fan";
-static const char *const NVS_PAIRING_KEY = "pairing_info";
+
+// nRF905 SPI instructions
+static constexpr uint8_t NRF905_W_CONFIG = 0x00;
+static constexpr uint8_t NRF905_R_CONFIG = 0x10;
+static constexpr uint8_t NRF905_W_TX_PAYLOAD = 0x20;
+static constexpr uint8_t NRF905_W_TX_ADDRESS = 0x22;
+static constexpr uint8_t NRF905_R_RX_PAYLOAD = 0x24;
+
+// Distinguishes the pairing preference from the fan state preference of the same entity.
+static constexpr uint32_t PAIRING_PREFERENCE_VERSION = 0x5A464E31;  // "ZFN1"
+
+static constexpr int SPEED_COUNT = 4;
+
+static std::array<uint8_t, 4> to_little_endian(uint32_t value) {
+    return {static_cast<uint8_t>(value), static_cast<uint8_t>(value >> 8), static_cast<uint8_t>(value >> 16),
+            static_cast<uint8_t>(value >> 24)};
+}
+
+// =========================================================================
+// Frame
+// =========================================================================
+
+Frame::Frame(uint8_t rx_type, uint8_t rx_id, uint8_t tx_type, uint8_t tx_id, FrameType type,
+             std::initializer_list<uint8_t> parameters) {
+    const size_t count = std::min(parameters.size(), MAX_PARAMETERS);
+    this->bytes_[0] = rx_type;
+    this->bytes_[1] = rx_id;
+    this->bytes_[2] = tx_type;
+    this->bytes_[3] = tx_id;
+    this->bytes_[4] = FRAME_TTL;
+    this->bytes_[5] = type;
+    this->bytes_[6] = static_cast<uint8_t>(count);
+    std::copy_n(parameters.begin(), count, this->bytes_.begin() + 7);
+}
+
+uint32_t Frame::network_id() const {
+    return static_cast<uint32_t>(this->parameter(0)) | (static_cast<uint32_t>(this->parameter(1)) << 8) |
+           (static_cast<uint32_t>(this->parameter(2)) << 16) | (static_cast<uint32_t>(this->parameter(3)) << 24);
+}
 
 // =========================================================================
 // 1. NRF905Controller Implementation
 // =========================================================================
 
-void NRF905Controller::setup_pins(GPIOPin *pwr_pin, GPIOPin *ce_pin, GPIOPin *txen_pin, GPIOPin *dr_pin) {
-    this->pwr_pin_ = pwr_pin;
-    this->ce_pin_ = ce_pin;
-    this->txen_pin_ = txen_pin;
-    this->dr_pin_ = dr_pin;
-}
-
-bool NRF905Controller::init() {
-    // Initialize SPI device
+bool NRF905Controller::setup() {
     this->spi_setup();
-    
+
     this->pwr_pin_->setup();
     this->ce_pin_->setup();
     this->txen_pin_->setup();
     this->dr_pin_->setup();
 
-    this->set_mode_idle();
+    this->write_config_();
+    if (!this->verify_config_()) {
+        ESP_LOGE(TAG, "nRF905 does not respond; check the wiring.");
+        return false;
+    }
 
-    // Zehnder nRF905 configuration profile from fan.h
-    const uint8_t zehnder_config[] = {0x76, 0x2E, 0x44, 0x10, 0x10, 0xA5, 0x5A, 0x5A, 0xA5, 0xDB};
-    this->write_config_registers(zehnder_config, sizeof(zehnder_config));
-
-    ESP_LOGD(TAG, "NRF905 initialized.");
+    ESP_LOGD(TAG, "nRF905 initialized.");
     return true;
+}
+
+void NRF905Controller::dump_config() {
+    LOG_PIN("  CS Pin: ", this->cs_);
+    LOG_PIN("  PWR Pin: ", this->pwr_pin_);
+    LOG_PIN("  CE Pin: ", this->ce_pin_);
+    LOG_PIN("  TXEN Pin: ", this->txen_pin_);
+    LOG_PIN("  DR Pin: ", this->dr_pin_);
 }
 
 void NRF905Controller::set_mode_idle() {
@@ -63,54 +102,59 @@ void NRF905Controller::set_mode_transmit() {
     this->ce_pin_->digital_write(true);
 }
 
-void NRF905Controller::set_tx_address(uint32_t address) {
+void NRF905Controller::set_network_address(uint32_t address) {
+    const auto bytes = to_little_endian(address);
+
+    // The receive address lives in the config registers...
+    std::copy(bytes.begin(), bytes.end(), this->config_.begin() + CONFIG_RX_ADDRESS_OFFSET);
+    this->write_config_();
+
+    // ...while the transmit address has its own instruction.
     this->enable();
-    this->write_byte(0x22); // W_TX_ADDRESS
-    this->write_byte((address >> 0) & 0xFF);
-    this->write_byte((address >> 8) & 0xFF);
-    this->write_byte((address >> 16) & 0xFF);
-    this->write_byte((address >> 24) & 0xFF);
+    this->write_byte(NRF905_W_TX_ADDRESS);
+    this->write_array(bytes.data(), bytes.size());
     this->disable();
 }
 
-void NRF905Controller::set_rx_address(uint32_t address) {
-    // RX address is set via config registers, not a direct command
-    const uint8_t config_update[] = {
-        0x76, 0x2E, 0x44, 0x10, 0x10, // Keep first 5 bytes
-        (uint8_t)((address >> 0) & 0xFF),
-        (uint8_t)((address >> 8) & 0xFF),
-        (uint8_t)((address >> 16) & 0xFF),
-        (uint8_t)((address >> 24) & 0xFF),
-        0xDB, // Keep last byte
-    };
-    this->write_config_registers(config_update, sizeof(config_update));
-}
-
-
-void NRF905Controller::write_tx_payload(const uint8_t *payload, size_t size) {
-    this->enable();
-    this->write_byte(0x20); // W_TX_PAYLOAD
-    this->write_array(payload, size);
-    this->disable();
-}
-
-bool NRF905Controller::read_rx_payload(uint8_t *buffer, size_t size) {
-    if (!this->is_data_ready()) {
-        return false;
-    }
-    this->enable();
-    this->write_byte(0x24); // R_RX_PAYLOAD
-    this->read_array(buffer, size);
-    this->disable();
-    return true;
-}
-
-void NRF905Controller::write_config_registers(const uint8_t *config, size_t size) {
+void NRF905Controller::write_tx_payload(const Frame &frame) {
     this->set_mode_idle();
     this->enable();
-    this->write_byte(0x00); // W_CONFIG
-    this->write_array(config, size);
+    this->write_byte(NRF905_W_TX_PAYLOAD);
+    this->write_array(frame.bytes().data(), frame.bytes().size());
     this->disable();
+}
+
+std::optional<Frame> NRF905Controller::read_rx_payload() {
+    if (!this->dr_pin_->digital_read()) {
+        return std::nullopt;
+    }
+
+    // Go to standby first, so a new packet cannot overwrite the payload while it is clocked out.
+    this->set_mode_idle();
+
+    Frame frame;
+    this->enable();
+    this->write_byte(NRF905_R_RX_PAYLOAD);
+    this->read_array(frame.bytes().data(), frame.bytes().size());
+    this->disable();
+    return frame;
+}
+
+void NRF905Controller::write_config_() {
+    this->set_mode_idle();
+    this->enable();
+    this->write_byte(NRF905_W_CONFIG);
+    this->write_array(this->config_.data(), this->config_.size());
+    this->disable();
+}
+
+bool NRF905Controller::verify_config_() {
+    Config read_back{};
+    this->enable();
+    this->write_byte(NRF905_R_CONFIG);
+    this->read_array(read_back.data(), read_back.size());
+    this->disable();
+    return read_back == this->config_;
 }
 
 
@@ -118,258 +162,187 @@ void NRF905Controller::write_config_registers(const uint8_t *config, size_t size
 // 2. ZehnderFanProtocol Implementation
 // =========================================================================
 
-ZehnderFanProtocol::ZehnderFanProtocol(NRF905Controller *radio) : radio_(radio) {
-    // Initialize pending operation to idle state
-    pending_op_.type = RadioOperationType::NONE;
-    pending_op_.state = RadioOperationState::IDLE;
-}
-
-void ZehnderFanProtocol::start_pairing() {
-    if (pending_op_.state != RadioOperationState::IDLE) {
-        ESP_LOGW(TAG, "Cannot start pairing: Radio operation already in progress");
-        return;
+bool ZehnderFanProtocol::start_pairing() {
+    if (this->is_busy()) {
+        return false;
     }
-    
-    ESP_LOGD(TAG, "Starting fan pairing discovery...");
-    
-    // Initialize pairing operation
-    pending_op_.type = RadioOperationType::PAIRING_DISCOVER;
-    pending_op_.state = RadioOperationState::IDLE; // Will be set to TRANSMITTING by setup_pairing_discover
-    pending_op_.data.pairing.my_device_id = random_uint32() & 0xFE; // Avoid 0xFF
-    if (pending_op_.data.pairing.my_device_id == 0x00) 
-        pending_op_.data.pairing.my_device_id = 1;
-    pending_op_.data.pairing.pairing_step = 0;
-    
-    setup_pairing_discover();
+
+    this->peer_ = {};
+    // Our own id for this network; 0x00 and 0xFF are reserved.
+    this->peer_.my_device_id = static_cast<uint8_t>(1 + random_uint32() % 254);
+
+    ESP_LOGD(TAG, "Searching for a unit that is open for pairing (my device ID: 0x%02X)...", this->peer_.my_device_id);
+
+    this->radio_.set_network_address(NETWORK_LINK_ID);
+    const auto link_id = to_little_endian(NETWORK_LINK_ID);
+    // The receiver fields of this frame are fixed values rather than a real address.
+    this->begin_step_(Step::PAIRING_DISCOVER,
+                      Frame(0x04, 0x00, DEVICE_TYPE_REMOTE_CONTROL, this->peer_.my_device_id, FRAME_NETWORK_JOIN_ACK,
+                            {link_id[0], link_id[1], link_id[2], link_id[3]}));
+    return true;
 }
 
-void ZehnderFanProtocol::start_set_speed(const FanPairingInfo &pairing_info, uint8_t speed, uint8_t timer_minutes) {
-    if (pending_op_.state != RadioOperationState::IDLE) {
-        ESP_LOGW(TAG, "Cannot set speed: Radio operation already in progress");
-        return;
+bool ZehnderFanProtocol::start_set_speed(const FanPairingInfo &pairing_info, FanSpeed speed, uint8_t timer_minutes) {
+    if (this->is_busy()) {
+        return false;
     }
-    
-    // Initialize set speed operation
-    pending_op_.type = RadioOperationType::SET_SPEED;
-    pending_op_.data.set_speed.pairing_info = pairing_info;
-    pending_op_.data.set_speed.speed = speed;
-    pending_op_.data.set_speed.timer_minutes = timer_minutes;
-    pending_op_.max_retries = FAN_TX_RETRIES;
-    pending_op_.retry_count = 0;
-    pending_op_.timeout_ms = FAN_REPLY_TIMEOUT_MS;
-    
-    // Setup radio for this network
-    radio_->set_mode_idle();
-    radio_->set_tx_address(pairing_info.network_id);
-    radio_->set_rx_address(pairing_info.network_id);
-    
-    // Prepare payload
-    memset(pending_op_.tx_payload, 0, FAN_FRAMESIZE);
-    pending_op_.tx_payload[0] = FAN_TYPE_MAIN_UNIT;
-    pending_op_.tx_payload[1] = pairing_info.main_unit_id;
-    pending_op_.tx_payload[2] = FAN_TYPE_REMOTE_CONTROL;
-    pending_op_.tx_payload[3] = pairing_info.my_device_id;
-    pending_op_.tx_payload[4] = 0xFA; // TTL
-    pending_op_.tx_payload[5] = (timer_minutes > 0) ? FAN_FRAME_SETTIMER : FAN_FRAME_SETSPEED;
-    pending_op_.tx_payload[6] = (timer_minutes > 0) ? 0x02 : 0x01; // Number of parameters
-    pending_op_.tx_payload[7] = speed;
-    pending_op_.tx_payload[8] = timer_minutes;
-    
-    start_transmit();
+
+    this->peer_ = pairing_info;
+    this->radio_.set_network_address(pairing_info.network_id);
+
+    const Frame frame = timer_minutes > 0
+        ? Frame(DEVICE_TYPE_MAIN_UNIT, pairing_info.main_unit_id, DEVICE_TYPE_REMOTE_CONTROL,
+                pairing_info.my_device_id, FRAME_SET_TIMER, {speed, timer_minutes})
+        : Frame(DEVICE_TYPE_MAIN_UNIT, pairing_info.main_unit_id, DEVICE_TYPE_REMOTE_CONTROL,
+                pairing_info.my_device_id, FRAME_SET_SPEED, {speed});
+    this->begin_step_(Step::SET_SPEED, frame);
+    return true;
 }
 
-void ZehnderFanProtocol::process() {
-    switch (pending_op_.state) {
-        case RadioOperationState::IDLE:
-            // Nothing to do
-            break;
-            
-        case RadioOperationState::TRANSMITTING:
-            // Check if we can move to receive mode (transmission should be quick)
-            pending_op_.state = RadioOperationState::WAITING_RESPONSE;
-            pending_op_.start_time = millis();
-            radio_->set_mode_receive();
-            break;
-            
-        case RadioOperationState::WAITING_RESPONSE:
-            // Check for received data
-            if (radio_->read_rx_payload(rx_buffer_, FAN_FRAMESIZE)) {
-                handle_response();
-            } else {
-                // Check for timeout
-                uint32_t elapsed = millis() - pending_op_.start_time;
-                if (elapsed >= pending_op_.timeout_ms) {
-                    retry_or_fail();
-                }
-            }
-            break;
-            
-        case RadioOperationState::OPERATION_COMPLETE:
-            // Operation finished, waiting for external reset
-            break;
+std::optional<OperationResult> ZehnderFanProtocol::loop() {
+    if (!this->is_busy()) {
+        return std::nullopt;
     }
-}
 
-void ZehnderFanProtocol::start_transmit() {
-    radio_->write_tx_payload(pending_op_.tx_payload, FAN_FRAMESIZE);
-    pending_op_.state = RadioOperationState::TRANSMITTING;
-    radio_->set_mode_transmit();
-    // Note: We'll move to WAITING_RESPONSE in the next process() call
-}
+    const uint32_t elapsed = millis() - this->phase_start_;
 
-void ZehnderFanProtocol::handle_response() {
-    if (pending_op_.type == RadioOperationType::SET_SPEED) {
-        // For set speed, any response is considered success
-        ESP_LOGD(TAG, "Set speed command acknowledged.");
-        complete_operation(true);
-        
-    } else if (pending_op_.type >= RadioOperationType::PAIRING_DISCOVER && 
-               pending_op_.type <= RadioOperationType::PAIRING_ACK) {
-        handle_pairing_response();
+    if (this->phase_ == Phase::TRANSMITTING) {
+        // The radio repeats the frame for as long as it stays in transmit mode.
+        if (elapsed >= TX_WINDOW_MS) {
+            this->radio_.set_mode_receive();
+            this->phase_ = Phase::LISTENING;
+            this->phase_start_ = millis();
+        }
+        return std::nullopt;
     }
-}
 
-void ZehnderFanProtocol::retry_or_fail() {
-    pending_op_.retry_count++;
-    
-    if (pending_op_.retry_count < pending_op_.max_retries) {
-        ESP_LOGD(TAG, "Radio timeout, retrying (%d/%d)", pending_op_.retry_count, pending_op_.max_retries);
-        start_transmit();
-    } else {
-        ESP_LOGW(TAG, "Radio operation failed after %d retries", pending_op_.max_retries);
-        complete_operation(false);
+    if (auto frame = this->radio_.read_rx_payload()) {
+        auto result = this->handle_frame_(*frame);
+        if (this->is_busy() && this->phase_ == Phase::LISTENING) {
+            // Not the frame we were waiting for; keep listening until the timeout.
+            this->radio_.set_mode_receive();
+        }
+        return result;
     }
-}
 
-void ZehnderFanProtocol::complete_operation(bool success) {
-    pending_op_.state = RadioOperationState::OPERATION_COMPLETE;
-    last_operation_success_ = success;
-    radio_->set_mode_idle();
-}
-
-std::optional<FanPairingInfo> ZehnderFanProtocol::get_pairing_result() {
-    if (pending_op_.type == RadioOperationType::PAIRING_ACK && 
-        pending_op_.state == RadioOperationState::OPERATION_COMPLETE &&
-        last_operation_success_) {
-        return pairing_result_;
+    if (elapsed >= REPLY_TIMEOUT_MS) {
+        return this->handle_timeout_();
     }
     return std::nullopt;
 }
 
-void ZehnderFanProtocol::reset_operation_state() {
-    pending_op_.state = RadioOperationState::IDLE;
-    pending_op_.type = RadioOperationType::NONE;
-    radio_->set_mode_idle();
+void ZehnderFanProtocol::begin_step_(Step step, const Frame &frame, uint8_t max_attempts) {
+    this->step_ = step;
+    this->tx_frame_ = frame;
+    this->attempt_ = 0;
+    this->max_attempts_ = max_attempts;
+    this->transmit_();
 }
 
-// Pairing state machine implementation
-void ZehnderFanProtocol::setup_pairing_discover() {
-    radio_->set_mode_idle();
-    radio_->set_tx_address(NETWORK_LINK_ID);
-    radio_->set_rx_address(NETWORK_LINK_ID);
-    
-    pending_op_.max_retries = FAN_TX_RETRIES;
-    pending_op_.retry_count = 0;
-    pending_op_.timeout_ms = FAN_REPLY_TIMEOUT_MS;
-    
-    // Prepare discovery payload
-    memset(pending_op_.tx_payload, 0, FAN_FRAMESIZE);
-    pending_op_.tx_payload[0] = 0x04;
-    pending_op_.tx_payload[1] = 0x00;
-    pending_op_.tx_payload[2] = FAN_TYPE_REMOTE_CONTROL;
-    pending_op_.tx_payload[3] = pending_op_.data.pairing.my_device_id;
-    pending_op_.tx_payload[4] = 0xFA;
-    pending_op_.tx_payload[5] = FAN_NETWORK_JOIN_ACK;
-    pending_op_.tx_payload[6] = 0x04;
-    pending_op_.tx_payload[7] = 0xa5;
-    pending_op_.tx_payload[8] = 0x5a;
-    pending_op_.tx_payload[9] = 0x5a;
-    pending_op_.tx_payload[10] = 0xa5;
-    
-    start_transmit();
+void ZehnderFanProtocol::transmit_() {
+    this->radio_.write_tx_payload(this->tx_frame_);
+    this->radio_.set_mode_transmit();
+    this->phase_ = Phase::TRANSMITTING;
+    this->phase_start_ = millis();
 }
 
-void ZehnderFanProtocol::setup_pairing_join() {
-    auto &info = pending_op_.data.pairing.current_info;
-    
-    radio_->set_tx_address(info.network_id);
-    radio_->set_rx_address(info.network_id);
-    
-    pending_op_.type = RadioOperationType::PAIRING_JOIN;
-    pending_op_.retry_count = 0;
-    
-    // Prepare join payload
-    memset(pending_op_.tx_payload, 0, FAN_FRAMESIZE);
-    pending_op_.tx_payload[0] = FAN_TYPE_MAIN_UNIT;
-    pending_op_.tx_payload[1] = info.main_unit_id;
-    pending_op_.tx_payload[2] = FAN_TYPE_REMOTE_CONTROL;
-    pending_op_.tx_payload[3] = pending_op_.data.pairing.my_device_id;
-    pending_op_.tx_payload[4] = 0xFA;
-    pending_op_.tx_payload[5] = FAN_NETWORK_JOIN_REQUEST;
-    pending_op_.tx_payload[7] = (info.network_id >> 0) & 0xFF;
-    pending_op_.tx_payload[8] = (info.network_id >> 8) & 0xFF;
-    pending_op_.tx_payload[9] = (info.network_id >> 16) & 0xFF;
-    pending_op_.tx_payload[10] = (info.network_id >> 24) & 0xFF;
-    
-    start_transmit();
-}
+std::optional<OperationResult> ZehnderFanProtocol::handle_frame_(const Frame &frame) {
+    const bool for_me = frame.is_addressed_to(DEVICE_TYPE_REMOTE_CONTROL, this->peer_.my_device_id);
 
-void ZehnderFanProtocol::setup_pairing_ack() {
-    auto &info = pending_op_.data.pairing.current_info;
-    
-    pending_op_.type = RadioOperationType::PAIRING_ACK;
-    pending_op_.retry_count = 0;
-    pending_op_.max_retries = 1; // Fire and forget
-    
-    // Prepare ack payload
-    memset(pending_op_.tx_payload, 0, FAN_FRAMESIZE);
-    pending_op_.tx_payload[0] = FAN_TYPE_MAIN_UNIT;
-    pending_op_.tx_payload[1] = info.main_unit_id;
-    pending_op_.tx_payload[2] = FAN_TYPE_REMOTE_CONTROL;
-    pending_op_.tx_payload[3] = pending_op_.data.pairing.my_device_id;
-    pending_op_.tx_payload[4] = 0xFA;
-    pending_op_.tx_payload[5] = FAN_FRAME_0B;
-    
-    start_transmit();
-}
+    switch (this->step_) {
+        case Step::SET_SPEED:
+            // The unit answers a speed command with its current settings. Other frames on the
+            // network (such as units relaying our own command) do not tell us it was applied.
+            if (frame.type() == FRAME_FAN_SETTINGS && for_me) {
+                ESP_LOGD(TAG, "Unit acknowledged: speed %u, voltage %u%%, timer %u min.", frame.parameter(0),
+                         frame.parameter(1), frame.parameter(2));
+                return this->finish_(true);
+            }
+            break;
 
-void ZehnderFanProtocol::handle_pairing_response() {
-    if (pending_op_.type == RadioOperationType::PAIRING_DISCOVER) {
-        if (rx_buffer_[5] != FAN_NETWORK_JOIN_OPEN) {
-            ESP_LOGW(TAG, "Pairing failed: Received unexpected frame type 0x%02X.", rx_buffer_[5]);
-            complete_operation(false);
-            return;
-        }
-        
-        // Extract pairing info from response
-        auto &info = pending_op_.data.pairing.current_info;
-        info.main_unit_type = rx_buffer_[2];
-        info.main_unit_id = rx_buffer_[3];
-        info.network_id = (uint32_t)rx_buffer_[7] | ((uint32_t)rx_buffer_[8] << 8) | 
-                         ((uint32_t)rx_buffer_[9] << 16) | ((uint32_t)rx_buffer_[10] << 24);
-        info.my_device_id = pending_op_.data.pairing.my_device_id;
-        
-        ESP_LOGD(TAG, "Found fan unit ID 0x%02X on network 0x%08" PRIX32 ". Requesting to join...", 
-                 info.main_unit_id, info.network_id);
-        
-        // Move to join phase
-        setup_pairing_join();
-        
-    } else if (pending_op_.type == RadioOperationType::PAIRING_JOIN) {
-        // Join acknowledged, send final ack
-        ESP_LOGD(TAG, "Join request acknowledged, sending final ack...");
-        setup_pairing_ack();
-        
-    } else if (pending_op_.type == RadioOperationType::PAIRING_ACK) {
-        // Pairing complete!
-        auto &info = pending_op_.data.pairing.current_info;
-        pairing_result_ = info;
-        
-        ESP_LOGI(TAG, "Pairing successful! Network ID: 0x%08" PRIX32 ", Fan ID: 0x%02X, My Device ID: 0x%02X",
-                 info.network_id, info.main_unit_id, info.my_device_id);
-        
-        complete_operation(true);
+        case Step::PAIRING_DISCOVER:
+            if (frame.type() == FRAME_NETWORK_JOIN_OPEN && frame.network_id() != 0) {
+                this->peer_.main_unit_type = frame.tx_type();
+                this->peer_.main_unit_id = frame.tx_id();
+                this->peer_.network_id = frame.network_id();
+                ESP_LOGD(TAG, "Found unit 0x%02X on network 0x%08" PRIX32 ". Requesting to join...",
+                         this->peer_.main_unit_id, this->peer_.network_id);
+
+                this->radio_.set_network_address(this->peer_.network_id);
+                const auto network_id = to_little_endian(this->peer_.network_id);
+                this->begin_step_(Step::PAIRING_JOIN,
+                                  Frame(DEVICE_TYPE_MAIN_UNIT, this->peer_.main_unit_id, DEVICE_TYPE_REMOTE_CONTROL,
+                                        this->peer_.my_device_id, FRAME_NETWORK_JOIN_REQUEST,
+                                        {network_id[0], network_id[1], network_id[2], network_id[3]}));
+                return std::nullopt;
+            }
+            break;
+
+        case Step::PAIRING_JOIN:
+            // Most units accept with 0x0B; the ComfoAir E300 RF is reported to answer with 0x04.
+            if ((frame.type() == FRAME_NETWORK_JOIN_ACCEPTED || frame.type() == FRAME_NETWORK_JOIN_REQUEST) && for_me &&
+                frame.is_from(this->peer_.main_unit_type, this->peer_.main_unit_id)) {
+                ESP_LOGD(TAG, "Unit accepted the join request. Confirming...");
+                this->begin_step_(Step::PAIRING_CONFIRM,
+                                  Frame(DEVICE_TYPE_MAIN_UNIT, this->peer_.main_unit_id, DEVICE_TYPE_REMOTE_CONTROL,
+                                        this->peer_.my_device_id, FRAME_NETWORK_JOIN_ACCEPTED),
+                                  PAIRING_CONFIRM_ATTEMPTS);
+                return std::nullopt;
+            }
+            break;
+
+        case Step::PAIRING_CONFIRM:
+            // The unit closes the handshake with a frame that it addresses to itself.
+            if (frame.type() == FRAME_QUERY_NETWORK &&
+                frame.is_addressed_to(this->peer_.main_unit_type, this->peer_.main_unit_id) &&
+                frame.is_from(this->peer_.main_unit_type, this->peer_.main_unit_id)) {
+                return this->finish_(true);
+            }
+            break;
+
+        case Step::IDLE:
+            break;
     }
+
+    this->log_ignored_(frame);
+    return std::nullopt;
+}
+
+std::optional<OperationResult> ZehnderFanProtocol::handle_timeout_() {
+    this->attempt_++;
+    if (this->attempt_ < this->max_attempts_) {
+        ESP_LOGD(TAG, "No reply, retrying (%u/%u)", this->attempt_, this->max_attempts_);
+        this->transmit_();
+        return std::nullopt;
+    }
+
+    if (this->step_ == Step::PAIRING_CONFIRM) {
+        // The unit accepted our join request in the previous step, so we are paired even
+        // though we did not hear its final confirmation.
+        ESP_LOGW(TAG, "Unit did not confirm the pairing; assuming it succeeded.");
+        return this->finish_(true);
+    }
+
+    ESP_LOGW(TAG, "No reply after %u attempts.", this->max_attempts_);
+    return this->finish_(false);
+}
+
+OperationResult ZehnderFanProtocol::finish_(bool success) {
+    OperationResult result{};
+    result.type = this->step_ == Step::SET_SPEED ? OperationType::SET_SPEED : OperationType::PAIRING;
+    result.success = success;
+    if (success && result.type == OperationType::PAIRING) {
+        result.pairing_info = this->peer_;
+    }
+
+    this->step_ = Step::IDLE;
+    this->radio_.set_mode_idle();
+    return result;
+}
+
+void ZehnderFanProtocol::log_ignored_(const Frame &frame) const {
+    ESP_LOGD(TAG, "Ignoring frame type 0x%02X from %02X:%02X to %02X:%02X", frame.type(), frame.tx_type(),
+             frame.tx_id(), frame.rx_type(), frame.rx_id());
 }
 
 
@@ -378,232 +351,206 @@ void ZehnderFanProtocol::handle_pairing_response() {
 // =========================================================================
 
 void ZehnderFanComponent::setup() {
-    ESP_LOGCONFIG(TAG, "Setting up Zehnder Fan...");
-
-    // Initialize nRF905 SPI device
-    this->nrf_radio_.set_spi_parent(this->spi_parent_);
-    this->nrf_radio_.set_cs_pin(this->cs_pin_);
-    this->nrf_radio_.setup_pins(this->pwr_pin_, this->ce_pin_, this->txen_pin_, this->dr_pin_);
-    this->nrf_radio_.init();
-
-    this->fan_protocol_ = make_unique<ZehnderFanProtocol>(&this->nrf_radio_);
-    
-    // Initialize NVS
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
+    if (!this->radio_->setup()) {
+        this->mark_failed();
+        return;
     }
-    ESP_ERROR_CHECK(err);
 
-    if (this->load_pairing_info()) {
-        ESP_LOGI(TAG, "Loaded pairing info from NVS.");
-    } else {
-        ESP_LOGW(TAG, "No pairing info found. Fan needs to be paired.");
+    this->load_pairing_info_();
+
+    // The unit keeps running at its last speed while we reboot, so only restore what we
+    // know about it; nothing is transmitted here.
+    if (auto restore = this->restore_state_()) {
+        restore->apply(*this);
     }
 }
 
 void ZehnderFanComponent::loop() {
-    // Process async radio operations
-    this->fan_protocol_->process();
-    
-    // Handle operation completion
-    if (this->fan_protocol_->is_operation_complete()) {
-        this->handle_operation_complete();
+    if (auto result = this->protocol_.loop()) {
+        this->handle_result_(*result);
+    }
+    if (!this->protocol_.is_busy()) {
+        this->start_next_operation_();
     }
 }
 
-void ZehnderFanComponent::update() {
-    // Required by PollingComponent, but not needed for this implementation
-}
-
 void ZehnderFanComponent::dump_config() {
-    ESP_LOGCONFIG(TAG, "Zehnder Fan Component:");
-    LOG_PIN("  PWR Pin: ", this->pwr_pin_);
-    LOG_PIN("  CE Pin: ", this->ce_pin_);
-    LOG_PIN("  TXEN Pin: ", this->txen_pin_);
-    LOG_PIN("  DR Pin: ", this->dr_pin_);
+    LOG_FAN("", "Zehnder Fan", this);
+    this->radio_->dump_config();
     if (this->pairing_info_.has_value()) {
         ESP_LOGCONFIG(TAG, "  Paired Network ID: 0x%08" PRIX32, this->pairing_info_->network_id);
-        ESP_LOGCONFIG(TAG, "  Paired Fan ID: 0x%02X", this->pairing_info_->main_unit_id);
+        ESP_LOGCONFIG(TAG, "  Paired Unit ID: 0x%02X", this->pairing_info_->main_unit_id);
+        ESP_LOGCONFIG(TAG, "  My Device ID: 0x%02X", this->pairing_info_->my_device_id);
     } else {
-        ESP_LOGCONFIG(TAG, "  Device is not paired.");
+        ESP_LOGCONFIG(TAG, "  Not paired.");
+    }
+    if (this->is_failed()) {
+        ESP_LOGE(TAG, "  Communication with the nRF905 failed!");
     }
 }
 
 fan::FanTraits ZehnderFanComponent::get_traits() {
-    // The fan supports Off, Low, Medium, High, Max speeds.
-    return fan::FanTraits(false, true, false, 4);
+    // Speed levels: Low, Medium, High, Max. No oscillation or direction.
+    return fan::FanTraits(false, true, false, SPEED_COUNT);
 }
 
 void ZehnderFanComponent::control(const fan::FanCall &call) {
     if (!this->pairing_info_.has_value()) {
-        ESP_LOGE(TAG, "Cannot control fan: Not paired.");
-        return;
-    }
-    
-    // Check if radio is busy
-    if (this->component_state_ != ComponentOperationState::IDLE) {
-        ESP_LOGW(TAG, "Cannot control fan: Radio operation in progress, ignoring request.");
+        ESP_LOGE(TAG, "Cannot control fan: not paired.");
         return;
     }
 
-    // Store pending state changes
+    // Build on the most recent request, so calls that only change the state or only the speed
+    // combine correctly with a request that is still on its way to the unit.
+    Target target{this->state, this->speed};
+    if (this->queued_target_.has_value() && this->queued_target_->timer_minutes == 0) {
+        target = *this->queued_target_;
+    } else if (this->active_target_.has_value() && this->active_target_->timer_minutes == 0) {
+        target = *this->active_target_;
+    }
+
     if (call.get_state().has_value()) {
-        this->pending_fan_state_ = *call.get_state();
-        this->pending_state_change_ = true;
+        target.state = *call.get_state();
     }
     if (call.get_speed().has_value()) {
-        this->pending_fan_speed_ = *call.get_speed();
-        this->pending_state_change_ = true;
+        target.speed = *call.get_speed();
     }
+    target.speed = std::clamp(target.speed, 1, SPEED_COUNT);
 
-    uint8_t fan_speed = FAN_SPEED_AUTO; // Off
-    if (this->pending_fan_state_) {
-        switch (this->pending_fan_speed_) {
-            case 1: fan_speed = FAN_SPEED_LOW; break;
-            case 2: fan_speed = FAN_SPEED_MEDIUM; break;
-            case 3: fan_speed = FAN_SPEED_HIGH; break;
-            case 4: fan_speed = FAN_SPEED_MAX; break;
-        }
-    }
-    
-    // For now, timer is not implemented via Home Assistant fan model. Could be a separate service.
-    uint8_t timer = 0; 
-    
-    ESP_LOGD(TAG, "Setting fan speed to level %d", this->pending_fan_speed_);
-    
-    // Start async operation
-    this->component_state_ = ComponentOperationState::SETTING_SPEED;
-    this->fan_protocol_->start_set_speed(this->pairing_info_.value(), fan_speed, timer);
+    // Sent from loop() as soon as the radio is free; replaces any request that is still waiting.
+    this->queued_target_ = target;
 }
 
 void ZehnderFanComponent::start_pairing() {
-    ESP_LOGI(TAG, "Pairing service called. Attempting to discover and pair with fan...");
-    
-    // Check if radio is busy
-    if (this->component_state_ != ComponentOperationState::IDLE) {
-        ESP_LOGW(TAG, "Cannot start pairing: Radio operation in progress.");
-        return;
-    }
-    
-    // Start async pairing operation
-    this->component_state_ = ComponentOperationState::PAIRING;
-    this->fan_protocol_->start_pairing();
+    ESP_LOGI(TAG, "Pairing requested.");
+    this->pairing_requested_ = true;
 }
 
-void ZehnderFanComponent::handle_operation_complete() {
-    bool success = this->fan_protocol_->last_operation_successful();
-    
-    if (this->component_state_ == ComponentOperationState::SETTING_SPEED) {
-        if (success) {
-            // Apply the pending state changes
-            if (this->pending_state_change_) {
-                this->state = this->pending_fan_state_;
-                this->speed = this->pending_fan_speed_;
-                this->pending_state_change_ = false;
-                this->publish_state();
-                ESP_LOGD(TAG, "Fan speed set successfully");
+void ZehnderFanComponent::clear_pairing() {
+    // Preferences cannot be deleted, so store an empty record instead.
+    this->save_pairing_info_(FanPairingInfo{});
+    this->pairing_info_.reset();
+    this->queued_target_.reset();
+    ESP_LOGI(TAG, "Pairing cleared.");
+}
+
+void ZehnderFanComponent::set_speed_with_timer(int speed, uint8_t minutes) {
+    if (!this->pairing_info_.has_value()) {
+        ESP_LOGE(TAG, "Cannot control fan: not paired.");
+        return;
+    }
+    if (minutes == 0) {
+        ESP_LOGW(TAG, "Ignoring timer of 0 minutes.");
+        return;
+    }
+    this->queued_target_ = Target{true, std::clamp(speed, 1, SPEED_COUNT), minutes};
+}
+
+void ZehnderFanComponent::start_next_operation_() {
+    if (this->pairing_requested_) {
+        this->pairing_requested_ = false;
+        if (this->protocol_.start_pairing()) {
+            this->high_freq_.start();
+            return;
+        }
+    }
+
+    if (this->queued_target_.has_value() && this->pairing_info_.has_value()) {
+        const Target target = *this->queued_target_;
+        this->queued_target_.reset();
+
+        // "Off" is the unit's lowest setting: a ventilation unit never stops completely.
+        const FanSpeed speed = target.state ? static_cast<FanSpeed>(target.speed) : FAN_SPEED_AUTO;
+        ESP_LOGD(TAG, "Setting fan speed to %u (timer: %u min)", speed, target.timer_minutes);
+        if (this->protocol_.start_set_speed(*this->pairing_info_, speed, target.timer_minutes)) {
+            this->active_target_ = target;
+            this->high_freq_.start();
+            return;
+        }
+    }
+
+    this->high_freq_.stop();
+}
+
+void ZehnderFanComponent::handle_result_(const OperationResult &result) {
+    switch (result.type) {
+        case OperationType::SET_SPEED: {
+            const std::optional<Target> target = this->active_target_;
+            this->active_target_.reset();
+
+            if (!result.success) {
+                ESP_LOGW(TAG, "Failed to set fan speed.");
+            } else if (target.has_value() && target->timer_minutes == 0) {
+                this->state = target->state;
+                this->speed = target->speed;
             }
-        } else {
-            ESP_LOGW(TAG, "Failed to set fan speed");
+            // Also published on failure, so Home Assistant falls back to the last known state.
+            this->publish_state();
+            break;
         }
-        
-    } else if (this->component_state_ == ComponentOperationState::PAIRING) {
-        if (success) {
-            auto result = this->fan_protocol_->get_pairing_result();
-            if (result.has_value()) {
-                this->save_pairing_info(result.value());
-                this->load_pairing_info(); // Reload into component state
-                ESP_LOGI(TAG, "Pairing successful and info saved to flash.");
+
+        case OperationType::PAIRING:
+            if (result.success && result.pairing_info.has_value()) {
+                this->pairing_info_ = result.pairing_info;
+                this->save_pairing_info_(*result.pairing_info);
+                ESP_LOGI(TAG, "Paired with unit 0x%02X on network 0x%08" PRIX32 " (my device ID: 0x%02X).",
+                         result.pairing_info->main_unit_id, result.pairing_info->network_id,
+                         result.pairing_info->my_device_id);
+            } else {
+                ESP_LOGE(TAG, "Pairing failed. Is the unit open for pairing (just powered on)?");
             }
-        } else {
-            ESP_LOGE(TAG, "Pairing failed.");
-        }
-    }
-    
-    // Reset operation state and radio protocol state
-    this->component_state_ = ComponentOperationState::IDLE;
-    this->fan_protocol_->reset_operation_state();
-}
-
-void ZehnderFanComponent::save_pairing_info(const FanPairingInfo &info) {
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error (%s) opening NVS handle!", esp_err_to_name(err));
-        return;
-    }
-
-    err = nvs_set_blob(nvs_handle, NVS_PAIRING_KEY, &info, sizeof(FanPairingInfo));
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error (%s) writing pairing info to NVS!", esp_err_to_name(err));
-    } else {
-        err = nvs_commit(nvs_handle);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Error (%s) committing NVS!", esp_err_to_name(err));
-        } else {
-            ESP_LOGD(TAG, "Pairing info saved to NVS successfully.");
-        }
-    }
-
-    nvs_close(nvs_handle);
-}
-
-bool ZehnderFanComponent::load_pairing_info() {
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Error (%s) opening NVS handle for reading!", esp_err_to_name(err));
-        this->pairing_info_ = std::nullopt;
-        return false;
-    }
-
-    FanPairingInfo loaded_info;
-    size_t required_size = sizeof(FanPairingInfo);
-    err = nvs_get_blob(nvs_handle, NVS_PAIRING_KEY, &loaded_info, &required_size);
-    nvs_close(nvs_handle);
-
-    if (err == ESP_OK && required_size == sizeof(FanPairingInfo)) {
-        ESP_LOGI(TAG, "Loaded pairing info: Network ID 0x%08" PRIX32 ", Fan ID 0x%02X, My Device ID 0x%02X",
-                 loaded_info.network_id, loaded_info.main_unit_id, loaded_info.my_device_id);
-        this->pairing_info_ = loaded_info;
-        return true;
-    } else {
-        if (err == ESP_ERR_NVS_NOT_FOUND) {
-            ESP_LOGW(TAG, "No pairing info found in NVS. Device is not paired.");
-        } else {
-            ESP_LOGW(TAG, "Error (%s) reading pairing info from NVS!", esp_err_to_name(err));
-        }
-        this->pairing_info_ = std::nullopt;
-        return false;
+            break;
     }
 }
 
-void ZehnderFanComponent::clear_pairing_info() {
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error (%s) opening NVS handle for clearing!", esp_err_to_name(err));
-        return;
-    }
+void ZehnderFanComponent::load_pairing_info_() {
+    this->pairing_pref_ = this->make_entity_preference<FanPairingInfo>(PAIRING_PREFERENCE_VERSION);
 
-    err = nvs_erase_key(nvs_handle, NVS_PAIRING_KEY);
-    if (err == ESP_OK) {
-        err = nvs_commit(nvs_handle);
-        if (err == ESP_OK) {
-            ESP_LOGD(TAG, "Pairing info cleared from NVS successfully.");
-        } else {
-            ESP_LOGE(TAG, "Error (%s) committing NVS after clearing!", esp_err_to_name(err));
+    FanPairingInfo info{};
+    if (this->pairing_pref_.load(&info)) {
+        // An empty record means the pairing was cleared.
+        if (info.network_id != 0) {
+            this->pairing_info_ = info;
         }
-    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGD(TAG, "No pairing info to clear in NVS.");
-    } else {
-        ESP_LOGE(TAG, "Error (%s) clearing pairing info from NVS!", esp_err_to_name(err));
+    } else if (auto legacy = this->load_legacy_pairing_info_()) {
+        ESP_LOGI(TAG, "Migrated pairing info from the previous storage format.");
+        this->pairing_info_ = legacy;
+        this->save_pairing_info_(*legacy);
     }
 
-    nvs_close(nvs_handle);
-    this->pairing_info_ = std::nullopt;
+    if (this->pairing_info_.has_value()) {
+        ESP_LOGI(TAG, "Paired with unit 0x%02X on network 0x%08" PRIX32 ".", this->pairing_info_->main_unit_id,
+                 this->pairing_info_->network_id);
+    } else {
+        ESP_LOGW(TAG, "Not paired. Power cycle the ventilation unit and press the pair button.");
+    }
+}
+
+/// Earlier versions of this component stored the pairing info directly in NVS. Read it once,
+/// so existing installations do not have to pair again after updating.
+std::optional<FanPairingInfo> ZehnderFanComponent::load_legacy_pairing_info_() {
+#ifdef USE_ESP32
+    nvs_handle_t handle;
+    if (nvs_open("zehnder_fan", NVS_READONLY, &handle) != ESP_OK) {
+        return std::nullopt;
+    }
+
+    FanPairingInfo info{};
+    size_t size = sizeof(info);
+    const esp_err_t err = nvs_get_blob(handle, "pairing_info", &info, &size);
+    nvs_close(handle);
+
+    if (err == ESP_OK && size == sizeof(info) && info.network_id != 0) {
+        return info;
+    }
+#endif
+    return std::nullopt;
+}
+
+void ZehnderFanComponent::save_pairing_info_(const FanPairingInfo &info) {
+    if (!this->pairing_pref_.save(&info) || !global_preferences->sync()) {
+        ESP_LOGE(TAG, "Could not store the pairing info; it will be lost after a restart.");
+    }
 }
 
 } // namespace zehnder_fan

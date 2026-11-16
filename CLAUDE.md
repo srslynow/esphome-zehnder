@@ -12,7 +12,8 @@ The purpose of this repository is to wirelessly control a Zehnder Comfofan / Com
 
 .
 ├── CLAUDE.md
-├── PLAN.md
+├── LICENSE
+├── README.md
 ├── components
 │   └── zehnder_fan
 │       ├── __init__.py

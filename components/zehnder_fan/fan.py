@@ -1,54 +1,51 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import fan, spi
-from esphome.const import CONF_ID
 from esphome import pins
+from esphome.components import fan, spi
 
 DEPENDENCIES = ["spi"]
 
-# Define custom pin constants
+CONF_RADIO_ID = "radio_id"
+CONF_PWR_PIN = "pwr_pin"
+CONF_CE_PIN = "ce_pin"
 CONF_TXEN_PIN = "txen_pin"
 CONF_DR_PIN = "dr_pin"
-CONF_PWR_PIN = "pwr_pin"
-CONF_CS_PIN = "cs_pin"
-CONF_CE_PIN = "ce_pin"
 
 zehnder_fan_ns = cg.esphome_ns.namespace("zehnder_fan")
-ZehnderFanComponent = zehnder_fan_ns.class_("ZehnderFanComponent", fan.Fan, cg.PollingComponent)
+NRF905Controller = zehnder_fan_ns.class_("NRF905Controller", spi.SPIDevice)
+ZehnderFanComponent = zehnder_fan_ns.class_(
+    "ZehnderFanComponent", fan.Fan, cg.Component
+)
 
 CONFIG_SCHEMA = (
-    fan.fan_schema(ZehnderFanComponent)
+    # The ventilation unit keeps its speed while the controller restarts, so by default
+    # assume it is still doing what we last told it to do.
+    fan.fan_schema(ZehnderFanComponent, default_restore_mode="RESTORE_DEFAULT_OFF")
     .extend(
         {
-            cv.GenerateID(): cv.declare_id(ZehnderFanComponent),
+            cv.GenerateID(CONF_RADIO_ID): cv.declare_id(NRF905Controller),
             cv.Required(CONF_PWR_PIN): pins.gpio_output_pin_schema,
             cv.Required(CONF_CE_PIN): pins.gpio_output_pin_schema,
             cv.Required(CONF_TXEN_PIN): pins.gpio_output_pin_schema,
             cv.Required(CONF_DR_PIN): pins.gpio_input_pin_schema,
-            cv.Required(CONF_CS_PIN): pins.gpio_output_pin_schema,
-            cv.Required(spi.CONF_SPI_ID): cv.use_id(spi.SPIComponent),
         }
     )
-    .extend(cv.polling_component_schema("1s"))
+    .extend(cv.COMPONENT_SCHEMA)
+    .extend(spi.spi_device_schema(cs_pin_required=True))
 )
 
+
 async def to_code(config):
-    var = cg.new_Pvariable(config[CONF_ID])
+    radio = cg.new_Pvariable(config[CONF_RADIO_ID])
+    await spi.register_spi_device(radio, config)
+    for conf_pin, setter in (
+        (CONF_PWR_PIN, radio.set_pwr_pin),
+        (CONF_CE_PIN, radio.set_ce_pin),
+        (CONF_TXEN_PIN, radio.set_txen_pin),
+        (CONF_DR_PIN, radio.set_dr_pin),
+    ):
+        pin = await cg.gpio_pin_expression(config[conf_pin])
+        cg.add(setter(pin))
+
+    var = await fan.new_fan(config, radio)
     await cg.register_component(var, config)
-    await fan.register_fan(var, config)
-
-    # Set SPI parent
-    spi_parent = await cg.get_variable(config[spi.CONF_SPI_ID])
-    cg.add(var.set_spi_parent(spi_parent))
-
-    # Register pins
-    pwr_pin = await cg.gpio_pin_expression(config[CONF_PWR_PIN])
-    cg.add(var.set_pwr_pin(pwr_pin))
-    ce_pin = await cg.gpio_pin_expression(config[CONF_CE_PIN])
-    cg.add(var.set_ce_pin(ce_pin))
-    txen_pin = await cg.gpio_pin_expression(config[CONF_TXEN_PIN])
-    cg.add(var.set_txen_pin(txen_pin))
-    dr_pin = await cg.gpio_pin_expression(config[CONF_DR_PIN])
-    cg.add(var.set_dr_pin(dr_pin))
-    cs_pin = await cg.gpio_pin_expression(config[CONF_CS_PIN])
-    cg.add(var.set_cs_pin(cs_pin))

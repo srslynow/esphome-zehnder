@@ -39,3 +39,8 @@
 
 # debug information files
 *.dwo
+
+# ESPHome
+/.esphome/
+/secrets.yaml
+__pycache__/
