@@ -254,8 +254,7 @@ std::optional<OperationResult> ZehnderFanProtocol::handle_frame_(const Frame &fr
             // The unit answers a speed command with its current settings. Other frames on the
             // network (such as units relaying our own command) do not tell us it was applied.
             if (frame.type() == FRAME_FAN_SETTINGS && for_me) {
-                ESP_LOGD(TAG, "Unit acknowledged: speed %u, voltage %u%%, timer %u min.", frame.parameter(0),
-                         frame.parameter(1), frame.parameter(2));
+                ESP_LOGD(TAG, "Unit acknowledged: speed %u, voltage %u%%.", frame.parameter(0), frame.parameter(1));
                 return this->finish_(true);
             }
             break;
